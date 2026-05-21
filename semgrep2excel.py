@@ -1,17 +1,26 @@
 #!/usr/bin/env python3
 """
-semgrep2excel.py — Converte output Semgrep in Excel (.xlsx) o CSV
+semgrep2excel.py — Lancia Semgrep e salva i finding in Excel (.xlsx) o CSV
 Compatibile con Windows e macOS | Python 3.8+
 
-USO:
-  # Excel (consigliato):
+USO DIRETTO (consigliato — lancia semgrep internamente):
+  # Scansione su file singolo:
+  python3 semgrep2excel.py UserService.java
+
+  # Scansione su directory intera:
+  python3 semgrep2excel.py src/
+
+  # Config personalizzata:
+  python3 semgrep2excel.py UserService.java --config semgrep-rules-java.yaml
+
+  # Output CSV invece di Excel:
+  python3 semgrep2excel.py UserService.java --csv
+
+  # Nome file output personalizzato:
+  python3 semgrep2excel.py UserService.java -o report_gruppoA.xlsx
+
+USO PIPE (compatibilità con versione precedente):
   semgrep --config rules.yaml . --json | python3 semgrep2excel.py
-
-  # CSV (se openpyxl non è installato):
-  semgrep --config rules.yaml . --json | python3 semgrep2excel.py --csv
-
-  # Specificare nome file output:
-  semgrep --config rules.yaml . --json | python3 semgrep2excel.py -o report_21maggio.xlsx
 
 INSTALLAZIONE DIPENDENZE (una sola volta):
   pip install openpyxl
@@ -21,6 +30,8 @@ import json
 import sys
 import csv
 import os
+import subprocess
+import shutil
 import argparse
 from datetime import datetime
 
@@ -56,9 +67,16 @@ def parse_findings(data):
     rows = []
     for f in data.get("results", []):
         meta     = f["extra"].get("metadata", {})
-        cwe_raw  = meta.get("cwe", "")
-        cwe_id   = cwe_raw if cwe_raw.startswith("CWE-") else ""
+        def to_str(val):
+            """Normalizza stringa o lista in stringa singola."""
+            if isinstance(val, list):
+                return ", ".join(str(v) for v in val) if val else ""
+            return val or ""
+
+        cwe_raw  = to_str(meta.get("cwe", ""))
+        cwe_id   = cwe_raw.split(",")[0].strip() if cwe_raw.startswith("CWE-") else ""
         cwe_desc = CWE_LABELS.get(cwe_id, "")
+        owasp    = to_str(meta.get("owasp", ""))
         sev_raw  = f["extra"].get("severity", "INFO")
 
         rows.append({
@@ -68,7 +86,7 @@ def parse_findings(data):
             "Severità":       SEVERITY_IT.get(sev_raw, sev_raw),
             "CWE":            cwe_id,
             "Descrizione CWE":cwe_desc,
-            "OWASP":          meta.get("owasp", ""),
+            "OWASP":          owasp,
             "Messaggio":      f["extra"].get("message", ""),
             "Stato fix":      "Aperto",      # campo compilabile in aula
             "Note":           "",            # campo compilabile in aula
@@ -197,37 +215,153 @@ def to_excel(rows, output_path):
           f"{sum(1 for r in rows if r['Severità']=='CRITICO')} critici)")
 
 
+def find_semgrep():
+    """Trova l'eseguibile semgrep su Windows e macOS/Linux."""
+    # Cerca prima nel PATH standard
+    semgrep = shutil.which("semgrep")
+    if semgrep:
+        return semgrep
+
+    # Percorsi comuni su Windows (pip install --user)
+    win_paths = [
+        os.path.expanduser(r"~\AppData\Local\Programs\Python\Python3*\Scripts\semgrep.exe"),
+        os.path.expanduser(r"~\AppData\Roaming\Python\Python3*\Scripts\semgrep.exe"),
+    ]
+    for p in win_paths:
+        import glob
+        matches = glob.glob(p)
+        if matches:
+            return matches[0]
+
+    return None
+
+
+def run_semgrep(target, config):
+    """Lancia semgrep sul target e restituisce il JSON dei risultati."""
+    semgrep_bin = find_semgrep()
+
+    if not semgrep_bin:
+        print("❌ semgrep non trovato nel PATH.")
+        print("   Installa con: pip install semgrep")
+        sys.exit(1)
+
+    # Cerca il file di config nella stessa cartella dello script se non specificato
+    if not os.path.isfile(config):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        candidate  = os.path.join(script_dir, config)
+        if os.path.isfile(candidate):
+            config = candidate
+        else:
+            print(f"❌ Config non trovata: {config}")
+            print(f"   Metti '{config}' nella stessa cartella di semgrep2excel.py")
+            sys.exit(1)
+
+    if not os.path.exists(target):
+        print(f"❌ Target non trovato: {target}")
+        sys.exit(1)
+
+    print(f"🔍 Scansione in corso: {target}  (config: {config})")
+
+    result = subprocess.run(
+        [semgrep_bin, "--config", config, target, "--json"],
+        capture_output=True,
+        text=True,
+    )
+
+    # semgrep esce con codice 1 se trova finding — è normale
+    if result.returncode not in (0, 1):
+        print(f"❌ Semgrep ha restituito un errore (exit {result.returncode}):")
+        print(result.stderr[-800:] if result.stderr else "(nessun dettaglio)")
+        sys.exit(1)
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        print("❌ Output semgrep non è JSON valido.")
+        print("Stderr:", result.stderr[-400:])
+        sys.exit(1)
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Converte output Semgrep JSON in Excel o CSV"
+        description="Converte output Semgrep in Excel o CSV",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Esempi:
+  python3 semgrep2excel.py --json output.json
+  python3 semgrep2excel.py --json output.json -o report_gruppoA.xlsx
+  python3 semgrep2excel.py --json output.json --csv
+  python3 semgrep2excel.py UserService.java
+  python3 semgrep2excel.py src/
+  semgrep --config rules.yaml . --json | python3 semgrep2excel.py
+        """
     )
     parser.add_argument(
-        "--csv", action="store_true",
+        "target",
+        nargs="?",
+        default=None,
+        help="File o directory da scansionare (es. UserService.java oppure src/)"
+    )
+    parser.add_argument(
+        "--json", "-j",
+        metavar="FILE.json",
+        default=None,
+        help="File JSON già prodotto da semgrep (es. --json output.json)"
+    )
+    parser.add_argument(
+        "--config", "-c",
+        default="semgrep-rules-java.yaml",
+        help="File di regole Semgrep (default: semgrep-rules-java.yaml)"
+    )
+    parser.add_argument(
+        "--csv",
+        action="store_true",
         help="Genera CSV invece di Excel"
     )
     parser.add_argument(
-        "-o", "--output", default=None,
+        "-o", "--output",
+        default=None,
         help="Nome file output (default: semgrep_YYYYMMDD_HHMM.xlsx/.csv)"
     )
     args = parser.parse_args()
 
-    # Legge da stdin (pipe da semgrep)
-    if sys.stdin.isatty():
-        print("❌ Nessun input. Usa:")
-        print("   semgrep --config rules.yaml . --json | python3 semgrep2excel.py")
-        sys.exit(1)
+    timestamp   = datetime.now().strftime("%Y%m%d_%H%M")
+    ext         = "csv" if args.csv else "xlsx"
+    output_path = args.output or f"semgrep_{timestamp}.{ext}"
 
-    try:
-        data = json.load(sys.stdin)
-    except json.JSONDecodeError as e:
-        print(f"❌ JSON non valido: {e}")
+    # --- MODALITÀ 1: file JSON già pronto ---
+    if args.json:
+        if not os.path.isfile(args.json):
+            print(f"❌ File JSON non trovato: {args.json}")
+            sys.exit(1)
+        print(f"📂 Lettura JSON: {args.json}")
+        with open(args.json, encoding="utf-8") as f:
+            try:
+                data = json.load(f)
+            except json.JSONDecodeError as e:
+                print(f"❌ JSON non valido: {e}")
+                sys.exit(1)
+
+    # --- MODALITÀ 2: target passato come argomento (lancia semgrep) ---
+    elif args.target:
+        data = run_semgrep(args.target, args.config)
+
+    # --- MODALITÀ 3: pipe da semgrep (retrocompatibilità) ---
+    elif not sys.stdin.isatty():
+        print("📥 Lettura da stdin (modalità pipe)...")
+        try:
+            data = json.load(sys.stdin)
+        except json.JSONDecodeError as e:
+            print(f"❌ JSON non valido da stdin: {e}")
+            sys.exit(1)
+
+    # --- Nessun input ---
+    else:
+        parser.print_help()
+        print("\n❌ Specifica --json FILE.json, un target, oppure usa la modalità pipe.")
         sys.exit(1)
 
     rows = parse_findings(data)
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    ext = "csv" if args.csv else "xlsx"
-    output_path = args.output or f"semgrep_{timestamp}.{ext}"
 
     if args.csv:
         to_csv(rows, output_path)
